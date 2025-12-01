@@ -5,8 +5,8 @@
       "name": "blob",
       "type": "blobTrigger",
       "direction": "in",
-      "path": "fd-logs-capture/{year}/{month}/{day}/{hour}/{namespace}/{hub}/{partition}/{fileName}",
-      "connection": "AzureWebJobsStorage"
+      "path": "fd-logs-capture/{year}/{month}/{day}/{hour}/{namespace}/{eventhub}/{partition}/{chunk}/{fileName}",
+      "connection": "FDLOGS_STORAGE_CONN_STR"
     }
   ]
 }
