@@ -19,9 +19,19 @@ def extract_token(uri: str):
     return m.group(1) if m else None
 
 
+# SAFE JSON serializer for AVRO records
+def safe_json(obj):
+    if isinstance(obj, (bytes, bytearray)):
+        # Convert bytes → utf-8 text safely
+        return obj.decode("utf-8", errors="ignore")
+    # Convert any unknown type → string
+    return str(obj)
+
+
 def main(blob: func.InputStream):
     logging.info(f"Processing blob: {blob.name}")
 
+    # Read & parse AVRO file
     try:
         avro_bytes = blob.read()
         avro_stream = io.BytesIO(avro_bytes)
@@ -34,15 +44,17 @@ def main(blob: func.InputStream):
         logging.info("No records in this file.")
         return
 
+    # Connect to SQL
     try:
         conn = pyodbc.connect(SQL_CONN_STR)
         cursor = conn.cursor()
+        logging.info("Connected to SQL successfully.")
     except Exception as e:
         logging.error(f"SQL connection error: {str(e)}")
         return
 
+    # Process each FD log row
     for rec in records:
-
         fd_time = rec.get("time")
         client_ip = rec.get("clientIp")
         http_method = rec.get("httpMethod")
@@ -58,20 +70,28 @@ def main(blob: func.InputStream):
         edge_location = rec.get("edgeLocationId")
 
         token = extract_token(request_uri)
-        raw_json = json.dumps(rec)
 
-        cursor.execute("""
-            INSERT INTO dbo.FD_RawLogs (
-                fd_time, client_ip, http_method, request_uri, user_agent, referrer,
-                http_status, cache_status, bytes_sent, activity_id, route_name,
-                backend_pool, edge_location, raw_json, token
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        fd_time, client_ip, http_method, request_uri, user_agent, referrer,
-        http_status, cache_status, bytes_sent, activity_id, route_name,
-        backend_pool, edge_location, raw_json, token)
+        # SAFE JSON dump (fixes byte serialization errors)
+        raw_json = json.dumps(rec, default=safe_json)
 
+        # Insert into SQL
+        try:
+            cursor.execute("""
+                INSERT INTO dbo.FD_RawLogs (
+                    fd_time, client_ip, http_method, request_uri, user_agent, referrer,
+                    http_status, cache_status, bytes_sent, activity_id, route_name,
+                    backend_pool, edge_location, raw_json, token
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            fd_time, client_ip, http_method, request_uri, user_agent, referrer,
+            http_status, cache_status, bytes_sent, activity_id, route_name,
+            backend_pool, edge_location, raw_json, token)
+        except Exception as e:
+            logging.error(f"SQL insert error: {str(e)}; rec={rec}")
+            continue
+
+    # Finalize SQL transaction
     conn.commit()
     cursor.close()
     conn.close()
