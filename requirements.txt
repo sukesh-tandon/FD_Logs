@@ -2,3 +2,5 @@ azure-functions
 azure-storage-blob
 fastavro
 pyodbc
+azure-functions
+fastavro
