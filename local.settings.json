@@ -1,0 +1,9 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "BLOB_CONN_STR": "<your connection string here>",
+    "SQL_CONN_STR": "Driver={ODBC Driver 17 for SQL Server};Server=tcp:duit-sqlserver.database.windows.net,1433;Database=campaign-db;Uid=<USER>;Pwd=<PASS>;Encrypt=yes;TrustServerCertificate=no;"
+  }
+}
