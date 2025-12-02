@@ -1,99 +1,103 @@
 import logging
-import json
 import azure.functions as func
-from fastavro import reader as avro_reader
-import pyodbc
+from azure.storage.blob import BlobServiceClient
+from fastavro import reader
 import io
+import pyodbc
+import json
+from datetime import datetime
+import pytz
 import re
 import os
 
-# SQL connection string from environment variable
-SQL_CONN_STR = os.environ["SQL_CONN_STR"]
 
-token_regex = re.compile(r"/([A-Za-z0-9]{4,12})(?:\?|/|$)")
-
-def extract_token(uri: str):
-    if not uri:
+def extract_token(url: str):
+    if not url:
         return None
-    m = token_regex.search(uri)
-    return m.group(1) if m else None
+    match = re.search(r"/DUITAI/([A-Za-z0-9]+)", url)
+    return match.group(1) if match else None
 
 
-# SAFE JSON serializer for AVRO records
-def safe_json(obj):
-    if isinstance(obj, (bytes, bytearray)):
-        # Convert bytes → utf-8 text safely
-        return obj.decode("utf-8", errors="ignore")
-    # Convert any unknown type → string
-    return str(obj)
-
-
-def main(blob: func.InputStream):
-    logging.info(f"Processing blob: {blob.name}")
-
-    # Read & parse AVRO file
+def convert_to_ist(utc_time_str):
     try:
-        avro_bytes = blob.read()
-        avro_stream = io.BytesIO(avro_bytes)
-        records = list(avro_reader(avro_stream))
-    except Exception as e:
-        logging.error(f"Failed to parse AVRO: {str(e)}")
-        return
+        dt_utc = datetime.fromisoformat(utc_time_str.replace("Z", "+00:00"))
+        ist = pytz.timezone("Asia/Kolkata")
+        return dt_utc.astimezone(ist)
+    except:
+        return None
 
-    if not records:
-        logging.info("No records in this file.")
-        return
 
-    # Connect to SQL
+def main(myblob: func.InputStream):
+    logging.info(f"Processing blob: {myblob.name}")
+
+    blob_conn_str = os.environ["FDLOGS_STORAGE_CONN"]
+    sql_conn_str = os.environ["SQL_CONN_STR"]
+
+    # Download AVRO blob
+    blob_service = BlobServiceClient.from_connection_string(blob_conn_str)
+    container_name = myblob.name.split("/")[0]
+
+    blob_client = blob_service.get_blob_client(
+        container=container_name,
+        blob="/".join(myblob.name.split("/")[1:])
+    )
+
+    avro_bytes = blob_client.download_blob().readall()
+    bytes_reader = io.BytesIO(avro_bytes)
+
+    # Prepare SQL connection
     try:
-        conn = pyodbc.connect(SQL_CONN_STR)
-        cursor = conn.cursor()
-        logging.info("Connected to SQL successfully.")
+        cnxn = pyodbc.connect(sql_conn_str)
+        cursor = cnxn.cursor()
     except Exception as e:
-        logging.error(f"SQL connection error: {str(e)}")
+        logging.error(f"SQL connection error: {e}")
         return
 
-    # Process each FD log row
-    for rec in records:
-        fd_time = rec.get("time")
-        client_ip = rec.get("clientIp")
-        http_method = rec.get("httpMethod")
-        request_uri = rec.get("requestUri")
-        user_agent = rec.get("userAgent")
-        referrer = rec.get("referrer")
-        http_status = rec.get("httpStatus")
-        cache_status = rec.get("cacheStatus")
-        bytes_sent = rec.get("sentBytes")
-        activity_id = rec.get("activityId")
-        route_name = rec.get("routeName")
-        backend_pool = rec.get("backendPoolId")
-        edge_location = rec.get("edgeLocationId")
+    # Process AVRO
+    for rec in reader(bytes_reader):
 
-        token = extract_token(request_uri)
-
-        # SAFE JSON dump (fixes byte serialization errors)
-        raw_json = json.dumps(rec, default=safe_json)
-
-        # Insert into SQL
         try:
-            cursor.execute("""
-                INSERT INTO dbo.FD_RawLogs (
-                    fd_time, client_ip, http_method, request_uri, user_agent, referrer,
-                    http_status, cache_status, bytes_sent, activity_id, route_name,
-                    backend_pool, edge_location, raw_json, token
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            fd_time, client_ip, http_method, request_uri, user_agent, referrer,
-            http_status, cache_status, bytes_sent, activity_id, route_name,
-            backend_pool, edge_location, raw_json, token)
+            body = json.loads(rec["Body"])
+            for log in body["records"]:
+                props = log.get("properties", {})
+
+                fd_time_utc = log.get("time")
+                fd_time_ist = convert_to_ist(fd_time_utc)
+
+                request_uri = props.get("requestUri")
+                origin_url = props.get("originUrl")
+
+                token = extract_token(request_uri) or extract_token(origin_url)
+
+                sql = """
+                INSERT INTO fd_logs
+                (fd_time, client_ip, http_method, request_uri, user_agent,
+                 http_status, cache_status, bytes_sent, activity_id,
+                 route_name, backend_pool, edge_location, raw_json, token)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+
+                cursor.execute(sql, (
+                    fd_time_ist,
+                    props.get("clientIp"),
+                    props.get("httpMethod"),
+                    request_uri,
+                    props.get("userAgent"),
+                    props.get("httpStatusCode"),
+                    props.get("cacheStatus"),
+                    props.get("responseBytes"),
+                    props.get("trackingReference"),
+                    props.get("routingRuleName"),
+                    props.get("originName"),
+                    props.get("pop"),
+                    json.dumps(log),
+                    token
+                ))
+
+            cnxn.commit()
+
         except Exception as e:
-            logging.error(f"SQL insert error: {str(e)}; rec={rec}")
-            continue
+            logging.error(f"Error processing record: {e}")
 
-    # Finalize SQL transaction
-    conn.commit()
     cursor.close()
-    conn.close()
-
-    logging.info(f"Ingested {len(records)} records.")
+    cnxn.close()
